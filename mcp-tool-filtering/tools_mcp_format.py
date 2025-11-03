@@ -2504,7 +2504,7 @@ MCP_TOOLS_CONFIG = {
         },
         {
             "name": "datadog.search_logs", 
-            "description": "Search and analyze log data for error investigation, application failures, HTTP status code analysis, and system debugging. Returns log events with context, metadata, and statistical analysis. Supports complex queries, time-based filtering, log correlation, and root cause analysis for service errors and performance issues.",
+            "description": "Search and analyze logs for services. Supports complex queries, time-based filtering, log correlation, and root cause analysis for service errors and performance issues.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3800,8 +3800,8 @@ MCP_TOOLS_CONFIG = {
 "type": "write"
 },
 {
-"name": "zendesk.audit_logs.search",
-"description": "Search admin audit logs for configuration changes affecting workflows or SLAs.",
+"name": "zendesk.audit_trail.search",
+"description": "Search admin audit trail for configuration changes affecting workflows or SLAs.",
 "inputSchema": {
 "type": "object",
 "properties": {
@@ -4002,8 +4002,8 @@ MCP_TOOLS_CONFIG = {
 "type": "write"
 },
 {
-"name": "hubspot.engagements.log_note",
-"description": "Log a note on a contact, company, deal, or ticket (e.g., meeting summary, risk update).",
+"name": "hubspot.engagements.create_note",
+"description": "Create a note on a contact, company, deal, or ticket (e.g., meeting summary, risk update).",
 "inputSchema": {
 "type": "object",
 "properties": {
@@ -4161,8 +4161,8 @@ MCP_TOOLS_CONFIG = {
 "type": "read"
 },
 {
-"name": "hubspot.playbooks.log_call_note",
-"description": "Open a playbook and log structured notes to a record (contact/company/deal/ticket).",
+"name": "hubspot.playbooks.create_call_note",
+"description": "Open a playbook and create structured notes to a record (contact/company/deal/ticket).",
 "inputSchema": {
 "type": "object",
 "properties": {
