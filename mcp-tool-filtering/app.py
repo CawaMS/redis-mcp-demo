@@ -19,12 +19,13 @@ import openai
 import tiktoken
 import numpy as np
 import struct
-import os
 
 # Configure environment for optimal performance
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Prevent tokenizer warnings
 
-from config import REDIS_CONFIG, OPENAI_CONFIG, DEMO_CONFIG, PERFORMANCE_CONFIG
+from config import REDIS_CONFIG, AZURE_OPENAI_CONFIG, DEMO_CONFIG, PERFORMANCE_CONFIG
+# Keep OPENAI_CONFIG alias for backward compatibility
+from config import OPENAI_CONFIG
 from tools_mcp_format import MCP_TOOLS_CONFIG
 
 
@@ -72,21 +73,46 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Mount logos directory
 app.mount("/logos", StaticFiles(directory="logos"), name="logos")
 
-# Embedding Service using SentenceTransformers
+# Embedding Service using Azure OpenAI
 class ToolEmbeddings:
     """
-    Optimized embedding generation with caching for maximum performance
+    Optimized embedding generation using Azure OpenAI text-embedding-ada-002
+    with Entra ID (formerly Azure AD) authentication and caching for maximum performance
     """
-    def __init__(self, model_name='all-MiniLM-L6-v2'):
-        """Initialize embedding model with performance optimizations"""
+    def __init__(self):
+        """Initialize Azure OpenAI embedding client with Entra ID authentication"""
         try:
-            from sentence_transformers import SentenceTransformer
-            from functools import lru_cache
+            from azure.identity import DefaultAzureCredential
+            from openai import AzureOpenAI
             import hashlib
             
-            print(f"Loading embedding model: {model_name}...")
-            self.model = SentenceTransformer(model_name)
-            self.dimension = self.model.get_sentence_embedding_dimension()
+            print("Initializing Azure OpenAI embedding service with Entra ID authentication...")
+            
+            # Initialize Azure credential (uses managed identity, Azure CLI, VS Code, etc.)
+            credential = DefaultAzureCredential()
+            
+            # Get Azure OpenAI configuration
+            from config import AZURE_OPENAI_CONFIG
+            
+            # Validate configuration
+            if AZURE_OPENAI_CONFIG["endpoint"] == "STUB_VALUE":
+                raise ValueError("Azure OpenAI endpoint not configured in config.py")
+            if AZURE_OPENAI_CONFIG["embedding_deployment"] == "STUB_VALUE":
+                raise ValueError("Azure OpenAI embedding deployment not configured in config.py")
+            
+            # Get token for Azure OpenAI
+            token = credential.get_token("https://cognitiveservices.azure.com/.default")
+            
+            # Initialize Azure OpenAI client
+            self.client = AzureOpenAI(
+                azure_endpoint=AZURE_OPENAI_CONFIG["endpoint"],
+                azure_ad_token=token.token,
+                api_version=AZURE_OPENAI_CONFIG["api_version"]
+            )
+            
+            self.deployment_name = AZURE_OPENAI_CONFIG["embedding_deployment"]
+            self.dimension = 1536  # text-embedding-ada-002 dimension
+            self.credential = credential
             self.available = True
             
             # Initialize embedding cache for performance optimization
@@ -95,14 +121,36 @@ class ToolEmbeddings:
             self._cache_misses = 0
             self._max_cache_size = PERFORMANCE_CONFIG.get("embedding_cache_size", 1000)
             
-            print(f"Embedding model loaded successfully. Dimension: {self.dimension}, Cache size: {self._max_cache_size}")
+            print(f"Azure OpenAI embedding service initialized successfully")
+            print(f"  Endpoint: {AZURE_OPENAI_CONFIG['endpoint']}")
+            print(f"  Deployment: {self.deployment_name}")
+            print(f"  Dimension: {self.dimension}")
+            print(f"  Cache size: {self._max_cache_size}")
+            print(f"  Authentication: Entra ID Default Credential")
+            
         except ImportError as e:
-            print(f"ERROR: sentence-transformers not installed: {e}")
-            print("Install with: pip3 install sentence-transformers")
-            raise ImportError("sentence-transformers is required for real embeddings")
+            print(f"ERROR: Required Azure packages not installed: {e}")
+            print("Install with: pip install azure-identity azure-core openai")
+            raise ImportError("azure-identity and openai are required for Azure OpenAI embeddings")
         except Exception as e:
-            print(f"ERROR: Failed to load embedding model: {e}")
-            raise RuntimeError(f"Cannot initialize embedding model: {e}")
+            print(f"ERROR: Failed to initialize Azure OpenAI embedding service: {e}")
+            raise RuntimeError(f"Cannot initialize Azure OpenAI embedding service: {e}")
+    
+    def _refresh_token_if_needed(self):
+        """Refresh Azure AD token if needed"""
+        try:
+            token = self.credential.get_token("https://cognitiveservices.azure.com/.default")
+            from config import AZURE_OPENAI_CONFIG
+            
+            # Create new client with refreshed token
+            from openai import AzureOpenAI
+            self.client = AzureOpenAI(
+                azure_endpoint=AZURE_OPENAI_CONFIG["endpoint"],
+                azure_ad_token=token.token,
+                api_version=AZURE_OPENAI_CONFIG["api_version"]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to refresh Azure AD token: {e}")
     
     def generate_embedding(self, text):
         """Generate embedding with caching for optimal performance"""
@@ -119,8 +167,14 @@ class ToolEmbeddings:
             return self._embedding_cache[cache_key]
         
         try:
-            # Generate embedding
-            embedding = self.model.encode(text, convert_to_numpy=True).astype(np.float32)
+            # Generate embedding using Azure OpenAI
+            response = self.client.embeddings.create(
+                input=text,
+                model=self.deployment_name
+            )
+            
+            # Extract embedding vector
+            embedding = np.array(response.data[0].embedding, dtype=np.float32)
             
             # Cache with size limit (LRU-like behavior)
             if len(self._embedding_cache) >= self._max_cache_size:
@@ -131,8 +185,32 @@ class ToolEmbeddings:
             self._embedding_cache[cache_key] = embedding
             self._cache_misses += 1
             return embedding
+            
         except Exception as e:
-            raise RuntimeError(f"SentenceTransformer embedding failed: {e}")
+            # Try refreshing token once on auth errors
+            if "401" in str(e) or "authentication" in str(e).lower():
+                logger.info("Authentication error, refreshing token...")
+                self._refresh_token_if_needed()
+                
+                # Retry once
+                try:
+                    response = self.client.embeddings.create(
+                        input=text,
+                        model=self.deployment_name
+                    )
+                    embedding = np.array(response.data[0].embedding, dtype=np.float32)
+                    
+                    if len(self._embedding_cache) >= self._max_cache_size:
+                        oldest_key = next(iter(self._embedding_cache))
+                        del self._embedding_cache[oldest_key]
+                    
+                    self._embedding_cache[cache_key] = embedding
+                    self._cache_misses += 1
+                    return embedding
+                except Exception as retry_error:
+                    raise RuntimeError(f"Azure OpenAI embedding failed after token refresh: {retry_error}")
+            
+            raise RuntimeError(f"Azure OpenAI embedding failed: {e}")
     
     def get_cache_stats(self):
         """Get embedding cache statistics"""
@@ -159,30 +237,75 @@ class ToolEmbeddings:
 
 class LLMService:
     """
-    LLM service for intelligent tool selection.
+    LLM service for intelligent tool selection using Azure OpenAI.
     
-    Uses OpenAI API to analyze queries and select the most relevant
-    tools from a provided set, returning structured responses with
-    performance metrics.
+    Uses Azure OpenAI API with Entra ID authentication to analyze queries 
+    and select the most relevant tools from a provided set, returning 
+    structured responses with performance metrics.
     """
     def __init__(self):
         self.client = None
         self.tokenizer = None
+        self.credential = None
         
     def initialize(self):
-        """Initialize OpenAI client and tokenizer"""
-        if not OPENAI_CONFIG["api_key"]:
-            logger.warning("OpenAI API key not provided - LLM features disabled")
+        """Initialize Azure OpenAI client with Entra ID authentication"""
+        from config import AZURE_OPENAI_CONFIG
+        
+        # Validate configuration
+        if AZURE_OPENAI_CONFIG["endpoint"] == "STUB_VALUE":
+            logger.warning("Azure OpenAI endpoint not configured - LLM features disabled")
+            return False
+        if AZURE_OPENAI_CONFIG["chat_deployment"] == "STUB_VALUE":
+            logger.warning("Azure OpenAI chat deployment not configured - LLM features disabled")
             return False
             
         try:
-            self.client = openai.OpenAI(api_key=OPENAI_CONFIG["api_key"])
-            self.tokenizer = tiktoken.encoding_for_model(OPENAI_CONFIG["model"])
-            logger.info(f"OpenAI client initialized with model: {OPENAI_CONFIG['model']}")
+            from azure.identity import DefaultAzureCredential
+            from openai import AzureOpenAI
+            
+            # Initialize Azure credential
+            self.credential = DefaultAzureCredential()
+            
+            # Get token for Azure OpenAI
+            token = self.credential.get_token("https://cognitiveservices.azure.com/.default")
+            
+            # Initialize Azure OpenAI client
+            self.client = AzureOpenAI(
+                azure_endpoint=AZURE_OPENAI_CONFIG["endpoint"],
+                azure_ad_token=token.token,
+                api_version=AZURE_OPENAI_CONFIG["api_version"]
+            )
+            
+            # Initialize tokenizer for the deployment model
+            # Note: Using cl100k_base encoding which works for GPT-4 and GPT-3.5-turbo
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+            
+            logger.info(f"Azure OpenAI client initialized")
+            logger.info(f"  Endpoint: {AZURE_OPENAI_CONFIG['endpoint']}")
+            logger.info(f"  Chat Deployment: {AZURE_OPENAI_CONFIG['chat_deployment']}")
+            logger.info(f"  Authentication: Entra ID Default Credential")
             return True
         except Exception as e:
-            logger.error(f"OpenAI initialization failed: {e}")
+            logger.error(f"Azure OpenAI initialization failed: {e}")
             return False
+    
+    def _refresh_token_if_needed(self):
+        """Refresh Azure AD token if needed"""
+        try:
+            from config import AZURE_OPENAI_CONFIG
+            from openai import AzureOpenAI
+            
+            token = self.credential.get_token("https://cognitiveservices.azure.com/.default")
+            
+            # Create new client with refreshed token
+            self.client = AzureOpenAI(
+                azure_endpoint=AZURE_OPENAI_CONFIG["endpoint"],
+                azure_ad_token=token.token,
+                api_version=AZURE_OPENAI_CONFIG["api_version"]
+            )
+        except Exception as e:
+            logger.warning(f"Failed to refresh Azure AD token: {e}")
     
     def count_tokens(self, text: str) -> int:
         """
@@ -260,10 +383,12 @@ Description: {full_tool['description']}"""
             Dictionary containing selected tools and performance metrics
         """
         if not self.client:
-            raise Exception("OpenAI client not initialized")
+            raise Exception("Azure OpenAI client not initialized")
+        
+        from config import AZURE_OPENAI_CONFIG
         
         start_time = time.time()
-        logger.info(f"LLM_SELECTION_START: tools_available={len(all_tools)} model={OPENAI_CONFIG['model']}")
+        logger.info(f"LLM_SELECTION_START: tools_available={len(all_tools)} deployment={AZURE_OPENAI_CONFIG['chat_deployment']}")
         
         # Format all tools for LLM context
         tools_context = self.format_tools_for_llm(all_tools)
@@ -294,10 +419,10 @@ Example response format:
         try:
             response = await asyncio.to_thread(
                 self.client.chat.completions.create,
-                model=OPENAI_CONFIG["model"],
+                model=AZURE_OPENAI_CONFIG["chat_deployment"],
                 messages=[{"role": "user", "content": input_prompt}],
-                max_tokens=OPENAI_CONFIG["max_tokens"],
-                temperature=OPENAI_CONFIG["temperature"],
+                max_tokens=AZURE_OPENAI_CONFIG["max_tokens"],
+                temperature=AZURE_OPENAI_CONFIG["temperature"],
                 timeout=30  
             )
             
@@ -306,8 +431,11 @@ Example response format:
             
             # Parse LLM response
             selected_tools_text = response.choices[0].message.content.strip()
-            output_tokens = self.count_tokens(selected_tools_text)
-            total_tokens = input_tokens + output_tokens
+            
+            # Get actual token usage from API response
+            input_tokens = response.usage.prompt_tokens if response.usage else input_tokens
+            output_tokens = response.usage.completion_tokens if response.usage else self.count_tokens(selected_tools_text)
+            total_tokens = response.usage.total_tokens if response.usage else (input_tokens + output_tokens)
             
             # Calculate cost (GPT-4o pricing: $4.25/1M input, $17.00/1M output)
             cost = (input_tokens * 0.00000425 + output_tokens * 0.000017)
@@ -341,7 +469,8 @@ Example response format:
                     logger.warning(f"LLM_NO_TOOLS_SELECTED: falling back to top {min(3, len(all_tools))} tools")
                     selected_tools = all_tools[:min(3, len(all_tools))]
                 
-                logger.info(f"LLM_SELECTION_COMPLETE: tools_selected={len(selected_tools)} tools_available={len(all_tools)} selection_rate={len(selected_tools)/len(all_tools):.2%}")
+                selection_rate = (len(selected_tools)/len(all_tools)) if len(all_tools) > 0 else 0
+                logger.info(f"LLM_SELECTION_COMPLETE: tools_selected={len(selected_tools)} tools_available={len(all_tools)} selection_rate={selection_rate:.2%}")
                 
                 # Professional analysis logging for demo transparency
                 token_reduction = ((len(all_tools) - len(selected_tools)) / len(all_tools)) * 100 if all_tools else 0
@@ -384,6 +513,70 @@ Example response format:
                 }
                 
         except Exception as e:
+            # Try refreshing token once on auth errors
+            if "401" in str(e) or "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
+                logger.info("Authentication error, refreshing token and retrying...")
+                self._refresh_token_if_needed()
+                
+                # Retry the request once
+                try:
+                    response = await asyncio.to_thread(
+                        self.client.chat.completions.create,
+                        model=AZURE_OPENAI_CONFIG["chat_deployment"],
+                        messages=[{"role": "user", "content": input_prompt}],
+                        max_tokens=AZURE_OPENAI_CONFIG["max_tokens"],
+                        temperature=AZURE_OPENAI_CONFIG["temperature"],
+                        timeout=30  
+                    )
+                    
+                    end_time = time.time()
+                    latency = round(end_time - start_time, 3)
+                    selected_tools_text = response.choices[0].message.content.strip()
+                    
+                    # Get actual token usage from API response
+                    input_tokens = response.usage.prompt_tokens if response.usage else input_tokens
+                    output_tokens = response.usage.completion_tokens if response.usage else self.count_tokens(selected_tools_text)
+                    total_tokens = response.usage.total_tokens if response.usage else (input_tokens + output_tokens)
+                    cost = (input_tokens * 0.00000425 + output_tokens * 0.000017)
+                    
+                    # Parse response (simplified retry logic)
+                    import json
+                    clean_text = selected_tools_text.strip()
+                    if clean_text.startswith("```json"):
+                        clean_text = clean_text[7:]
+                    if clean_text.endswith("```"):
+                        clean_text = clean_text[:-3]
+                    clean_text = clean_text.strip()
+                    
+                    selected_tool_names = json.loads(clean_text)
+                    if not isinstance(selected_tool_names, list):
+                        selected_tool_names = []
+                    
+                    selected_tools = []
+                    for tool_name in selected_tool_names:
+                        for tool in all_tools:
+                            if tool["name"] == tool_name:
+                                selected_tools.append(tool)
+                                break
+                    
+                    if len(selected_tools) == 0 and len(all_tools) > 0:
+                        selected_tools = all_tools[:min(3, len(all_tools))]
+                    
+                    return {
+                        "tools": selected_tools,
+                        "latency": latency,
+                        "tokens": total_tokens,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cost": cost,
+                        "llm_response": selected_tools_text
+                    }
+                except Exception as retry_error:
+                    end_time = time.time()
+                    error_latency = round(end_time - start_time, 3)
+                    logger.error(f"LLM_API_ERROR_AFTER_RETRY: error={str(retry_error)} latency={error_latency}s")
+                    raise
+            
             end_time = time.time()
             error_latency = round(end_time - start_time, 3)
             logger.error(f"LLM_API_ERROR: error={str(e)} latency={error_latency}s input_tokens={input_tokens if 'input_tokens' in locals() else 0}")
@@ -420,8 +613,8 @@ class ChatResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     redis: bool
-    sentence_transformers: bool
-    openai: bool
+    azure_openai_embeddings: bool
+    azure_openai_llm: bool
     timestamp: str
 
 # Load MCP tool definitions from configuration
@@ -429,7 +622,11 @@ TOOLS_CONFIG = MCP_TOOLS_CONFIG
 
 async def initialize_redis():
     """
-    Initialize Redis connection and vector search indexes.
+    Initialize Redis connection with Entra ID or password authentication.
+    
+    Supports both:
+    - Entra ID authentication (recommended for Azure Cache for Redis)
+    - Password-based authentication (for non-Azure Redis or fallback)
     
     Sets up both async and sync Redis clients for compatibility
     with RedisVL, and creates HNSW indexes for tool and cache search.
@@ -437,18 +634,62 @@ async def initialize_redis():
     global redis_client, sync_redis_client, search_index, cache_index, is_redis_connected
     
     try:
-        # Create both async and sync redis clients (RedisVL needs sync client)
-        redis_client = redis.from_url(REDIS_CONFIG["url"], decode_responses=True)
-        
-        # Also create sync client for RedisVL
-        import redis as sync_redis
-        global sync_redis_client
-        sync_redis_client = sync_redis.from_url(REDIS_CONFIG["url"], decode_responses=True)
+        if REDIS_CONFIG.get("use_entra_id", False):
+            # Use Entra ID authentication for Azure Cache for Redis
+            logger.info("Connecting to Azure Managed Redis with Entra ID authentication...")
+            
+            from redis_entraid.cred_provider import create_from_managed_identity, ManagedIdentityType
+            
+            # Create credential provider for managed identity or DefaultAzureCredential
+            # This will use system-assigned managed identity, or fall back to Azure CLI/VS Code auth
+            try:
+                credential_provider = create_from_managed_identity(
+                    identity_type=ManagedIdentityType.SYSTEM_ASSIGNED
+                )
+            except Exception:
+                # Fallback: try user-assigned or DefaultAzureCredential flow
+                # The library will handle DefaultAzureCredential internally
+                credential_provider = create_from_managed_identity(
+                    identity_type=ManagedIdentityType.SYSTEM_ASSIGNED
+                )
+            
+            # Create async Redis client with Entra ID credential provider
+            redis_client = redis.Redis(
+                host=REDIS_CONFIG["host"],
+                port=REDIS_CONFIG["port"],
+                credential_provider=credential_provider,
+                ssl=True,
+                ssl_cert_reqs="required",
+                decode_responses=True
+            )
+            
+            # Create sync client for RedisVL
+            import redis as sync_redis
+            sync_redis_client = sync_redis.Redis(
+                host=REDIS_CONFIG["host"],
+                port=REDIS_CONFIG["port"],
+                credential_provider=credential_provider,
+                ssl=True,
+                ssl_cert_reqs="required",
+                decode_responses=True
+            )
+            
+            logger.info(f"Using Entra ID authentication for Redis at {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
+        else:
+            # Use password-based authentication
+            logger.info("Connecting to Redis with password authentication...")
+            redis_client = redis.from_url(REDIS_CONFIG["url"], decode_responses=True)
+            
+            # Also create sync client for RedisVL
+            import redis as sync_redis
+            sync_redis_client = sync_redis.from_url(REDIS_CONFIG["url"], decode_responses=True)
+            
+            logger.info(f"Using password authentication for Redis at {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
         
         # Test connection
         await redis_client.ping()
         is_redis_connected = True
-        logger.info("Redis connection established successfully")
+        logger.info(f"Redis connection established successfully to {REDIS_CONFIG['host']}:{REDIS_CONFIG['port']}")
         
         # Initialize RedisVL indexes
         await setup_redisvl_indexes()
@@ -1204,27 +1445,27 @@ async def startup_event():
     Initialize all services on application startup.
     
     Sets up:
-    - Embedding service (SentenceTransformers)
+    - Embedding service (Azure OpenAI text-embedding-ada-002)
     - Redis connection and RedisVL indexes
     - Tool lookup cache
-    - LLM service (OpenAI)
+    - LLM service (Azure OpenAI with Entra ID)
     """
     logger.info("Initializing Redis MCP Latency Reduction Demo...")
     
-    # Initialize real embedding service (like redis-movie-search) - REQUIRED
+    # Initialize Azure OpenAI embedding service - REQUIRED
     global tool_embeddings
     try:
-        logger.info("Initializing SentenceTransformers embedding service...")
+        logger.info("Initializing Azure OpenAI embedding service...")
         tool_embeddings = ToolEmbeddings()
-        logger.info(f"SentenceTransformers ready: {tool_embeddings.dimension}-dimensional embeddings")
+        logger.info(f"Azure OpenAI embeddings ready: {tool_embeddings.dimension}-dimensional embeddings")
         # Update config with actual dimension
         PERFORMANCE_CONFIG["vector_dim"] = tool_embeddings.dimension
-        logger.info("Real-time embeddings enabled")
+        logger.info("Real-time embeddings enabled via Azure OpenAI")
     except Exception as e:
-        logger.error(f"CRITICAL: Embedding service initialization failed: {e}")
-        logger.error("This demo requires real embeddings with sentence-transformers")
-        logger.error("Install with: pip3 install sentence-transformers")
-        raise RuntimeError("Cannot start demo without real embedding service")
+        logger.error(f"CRITICAL: Azure OpenAI embedding service initialization failed: {e}")
+        logger.error("This demo requires Azure OpenAI with text-embedding-ada-002 deployment")
+        logger.error("Configure in config.py: endpoint, embedding_deployment, and ensure Entra ID authentication")
+        raise RuntimeError("Cannot start demo without Azure OpenAI embedding service")
     
     # Initialize global tool lookup cache for O(1) performance
     global tool_lookup_cache
@@ -1240,15 +1481,15 @@ async def startup_event():
     # Initialize LLM service for real tool selection
     global llm_service
     try:
-        logger.info("Initializing OpenAI LLM service...")
+        logger.info("Initializing Azure OpenAI LLM service...")
         llm_service = LLMService()
         llm_initialized = llm_service.initialize()
         if llm_initialized:
-            logger.info("OpenAI LLM ready for tool selection")
+            logger.info("Azure OpenAI LLM ready for tool selection")
         else:
-            logger.warning("LLM service disabled - set OPENAI_API_KEY for real LLM comparisons")
+            logger.warning("LLM service disabled - configure Azure OpenAI in config.py for real LLM comparisons")
     except Exception as e:
-        logger.warning(f"LLM service initialization failed: {e}")
+        logger.warning(f"Azure OpenAI LLM service initialization failed: {e}")
         logger.info("Demo will use fallback tool selection without LLM")
     
     logger.info("Demo initialization complete")
@@ -1264,13 +1505,13 @@ async def health_check() -> HealthResponse:
     Service health check endpoint.
     
     Returns status of all critical components including Redis,
-    embedding service, and LLM connectivity.
+    Azure OpenAI embedding service, and Azure OpenAI LLM connectivity.
     """
     return HealthResponse(
         status="ok",
         redis=is_redis_connected,
-        sentence_transformers=tool_embeddings is not None,
-        openai=llm_service is not None and llm_service.client is not None,
+        azure_openai_embeddings=tool_embeddings is not None,
+        azure_openai_llm=llm_service is not None and llm_service.client is not None,
         timestamp=datetime.now().isoformat()
     )
 

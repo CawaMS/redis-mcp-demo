@@ -9,23 +9,32 @@ SETUP INSTRUCTIONS:
 import os
 
 # =============================================================================
-# REDIS CONFIGURATION - Fill in your Redis Cloud credentials below
+# REDIS CONFIGURATION - Azure Cache for Redis with Entra ID
 # =============================================================================
-# Get these from your Redis Cloud dashboard:
-# 1. Public endpoint (looks like: redis-12345.c62.us-east-1-4.ec2.redns.redis-cloud.com:12345)
-# 2. Default user password
+# For Azure Cache for Redis:
+# 1. Get endpoint from Azure Portal (e.g., your-redis.redis.cache.windows.net:6380)
+# 2. Enable Entra ID authentication in Access Control (IAM)
+# 3. Assign "Redis Cache Contributor" role to your identity
+# 4. Set use_entra_id=True to use Entra ID instead of password
 
-_redis_endpoint = "STUB_VALUE"  # Replace with: redis-12345.c62.us-east-1-4.ec2.redns.redis-cloud.com:12345
-_redis_password = "STUB_VALUE"  # Replace with your Redis password
-_redis_username = "default"     # Usually leave as "default"
+_redis_endpoint = "STUB_VALUE"  # Replace with: your-redis.redis.cache.windows.net:6380
+_redis_use_entra_id = os.getenv("REDIS_USE_ENTRA_ID", "true").lower() == "true"  # Set to "false" to use password
+_redis_password = "STUB_VALUE"  # Only used if use_entra_id=False
+_redis_username = "default"  # Only used if use_entra_id=False
 
 
 # =============================================================================
-# OPENAI CONFIGURATION - Fill in your OpenAI API key below
+# AZURE OPENAI CONFIGURATION - Fill in your Azure OpenAI details below
 # =============================================================================
-# Get your API key from: https://platform.openai.com/api-keys
+# Get these from your Azure OpenAI resource in Azure Portal:
+# 1. Navigate to your Azure OpenAI resource
+# 2. Go to "Keys and Endpoint" to find your endpoint
+# 3. Deploy models for chat and embeddings
 
-_openai_api_key = "STUB_VALUE"  # Replace with: sk-proj-...
+_azure_openai_endpoint = "STUB_VALUE"  # Replace with: https://your-resource.openai.azure.com/
+_azure_openai_chat_deployment = "STUB_VALUE"  # Replace with your chat model deployment name (e.g., gpt-4)
+_azure_openai_embedding_deployment = "STUB_VALUE"  # Replace with your embedding model deployment name (e.g., text-embedding-ada-002)
+_azure_openai_api_version = "2024-02-01"  # API version - usually leave as is
 
 
 # =============================================================================
@@ -34,7 +43,11 @@ _openai_api_key = "STUB_VALUE"  # Replace with: sk-proj-...
 _redis_endpoint = os.getenv("REDIS_ENDPOINT", _redis_endpoint)
 _redis_password = os.getenv("REDIS_PASSWORD", _redis_password)
 _redis_username = os.getenv("REDIS_USERNAME", _redis_username)
-_openai_api_key = os.getenv("OPENAI_API_KEY", _openai_api_key)
+_redis_use_entra_id = os.getenv("REDIS_USE_ENTRA_ID", str(_redis_use_entra_id)).lower() == "true"
+_azure_openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", _azure_openai_endpoint)
+_azure_openai_chat_deployment = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", _azure_openai_chat_deployment)
+_azure_openai_embedding_deployment = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", _azure_openai_embedding_deployment)
+_azure_openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION", _azure_openai_api_version)
 
 
 # =============================================================================
@@ -45,7 +58,13 @@ _openai_api_key = os.getenv("OPENAI_API_KEY", _openai_api_key)
 if _redis_endpoint and ":" in _redis_endpoint:
     _redis_host, _redis_port = _redis_endpoint.rsplit(":", 1)
     _redis_port = int(_redis_port)
-    _redis_url = f"redis://{_redis_username}:{_redis_password}@{_redis_endpoint}"
+    
+    # For password-based auth, construct the URL with SSL
+    # For Entra ID auth, URL won't be used (we'll use host/port directly)
+    if not _redis_use_entra_id:
+        _redis_url = f"rediss://{_redis_username}:{_redis_password}@{_redis_endpoint}?ssl_cert_reqs=required"
+    else:
+        _redis_url = ""  # Not used with Entra ID
 else:
     _redis_host = _redis_endpoint if _redis_endpoint else "localhost"
     _redis_port = 6379
@@ -58,14 +77,20 @@ REDIS_CONFIG = {
     "username": _redis_username,
     "password": _redis_password,
     "url": _redis_url,
+    "use_entra_id": _redis_use_entra_id,
 }
 
-OPENAI_CONFIG = {
-    "api_key": _openai_api_key,
-    "model": os.getenv("OPENAI_MODEL", "gpt-4.1-nano"),
-    "max_tokens": int(os.getenv("OPENAI_MAX_TOKENS", "5000")),
-    "temperature": float(os.getenv("OPENAI_TEMPERATURE", "0.4")),
+AZURE_OPENAI_CONFIG = {
+    "endpoint": _azure_openai_endpoint,
+    "chat_deployment": _azure_openai_chat_deployment,
+    "embedding_deployment": _azure_openai_embedding_deployment,
+    "api_version": _azure_openai_api_version,
+    "max_tokens": int(os.getenv("AZURE_OPENAI_MAX_TOKENS", "5000")),
+    "temperature": float(os.getenv("AZURE_OPENAI_TEMPERATURE", "0.4")),
 }
+
+# Backward compatibility alias
+OPENAI_CONFIG = AZURE_OPENAI_CONFIG
 
 
 # Demo Configuration
@@ -79,8 +104,9 @@ DEMO_CONFIG = {
 # Performance Settings
 PERFORMANCE_CONFIG = {
     "cache_ttl": int(os.getenv("REDIS_CACHE_TTL", "300")),
-    "vector_dim": int(os.getenv("REDIS_VECTOR_DIM", "384")),  #  match sentence-transformers all-MiniLM-L6-v2
+    "vector_dim": int(os.getenv("REDIS_VECTOR_DIM", "1536")),  # Azure OpenAI text-embedding-ada-002 dimension
     "similarity_threshold": float(os.getenv("SIMILARITY_THRESHOLD", "0.2")),
     "cache_similarity_threshold": float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.70")),
     "max_vector_search_results": int(os.getenv("MAX_VECTOR_SEARCH_RESULTS", "10")),
+    "embedding_cache_size": int(os.getenv("EMBEDDING_CACHE_SIZE", "1000")),
 }
