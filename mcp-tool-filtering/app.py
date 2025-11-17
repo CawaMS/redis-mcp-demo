@@ -638,20 +638,14 @@ async def initialize_redis():
             # Use Entra ID authentication for Azure Cache for Redis
             logger.info("Connecting to Azure Managed Redis with Entra ID authentication...")
             
-            from redis_entraid.cred_provider import create_from_managed_identity, ManagedIdentityType
+            # Use create_from_default_azure_credential helper which handles everything
+            from redis_entraid.cred_provider import create_from_default_azure_credential
             
-            # Create credential provider for managed identity or DefaultAzureCredential
-            # This will use system-assigned managed identity, or fall back to Azure CLI/VS Code auth
-            try:
-                credential_provider = create_from_managed_identity(
-                    identity_type=ManagedIdentityType.SYSTEM_ASSIGNED
-                )
-            except Exception:
-                # Fallback: try user-assigned or DefaultAzureCredential flow
-                # The library will handle DefaultAzureCredential internally
-                credential_provider = create_from_managed_identity(
-                    identity_type=ManagedIdentityType.SYSTEM_ASSIGNED
-                )
+            logger.info("Using DefaultAzureCredential (Azure CLI, VS Code, etc.)")
+            credential_provider = create_from_default_azure_credential(
+                resource="https://redis.azure.com",
+                exclude_managed_identity_credential=True  # Skip IMDS timeout on local dev
+            )
             
             # Create async Redis client with Entra ID credential provider
             redis_client = redis.Redis(
@@ -808,6 +802,8 @@ async def index_tools_with_embeddings():
         existing_count = len(sync_redis_client.keys("tool:*"))
         expected_count = sum(len(tools) for tools in TOOLS_CONFIG.values())
         
+        logger.info(f"Tool indexing check: found {existing_count} tools in Redis, expected {expected_count}")
+        
         if existing_count >= expected_count:
             logger.info(f"Tools already indexed ({existing_count} found) - skipping reindexing")
             return
@@ -830,12 +826,12 @@ async def index_tools_with_embeddings():
                 if tools.index(tool) == 0:
                     debug_log("EMBEDDING_SAMPLE: %s tool text length=%d chars", server_name, len(tool_text))
                 
-                # Generate real embedding using SentenceTransformers 
+                # Generate real embedding using Azure OpenAI
                 try:
                     embedding_array = tool_embeddings.generate_embedding(tool_text)
                     embedding = embedding_array.tolist()
                     embedding_stats["sentence_transformers"] = embedding_stats.get("sentence_transformers", 0) + 1
-                    logger.debug(f"Generated SentenceTransformer embedding for {tool['name']} (dimensions: {len(embedding)})")
+                    logger.debug(f"Generated Azure OpenAI embedding for {tool['name']} (dimensions: {len(embedding)})")
                 except Exception as e:
                     logger.error(f"CRITICAL: Embedding generation failed for {tool['name']}: {e}")
                     raise RuntimeError(f"Cannot generate embedding for tool {tool['name']}: {e}")
@@ -859,7 +855,7 @@ async def index_tools_with_embeddings():
         # Format embedding statistics  
         stats_summary = []
         if embedding_stats.get("sentence_transformers", 0) > 0:
-            stats_summary.append(f"{embedding_stats['sentence_transformers']} SentenceTransformers")
+            stats_summary.append(f"{embedding_stats['sentence_transformers']} Azure OpenAI embeddings")
         
         logger.info(f"Embedding generation complete: {' + '.join(stats_summary)} = {len(tool_data)} total")
         
@@ -1015,6 +1011,11 @@ async def vector_search_tools(query: str, top_k: int = 3) -> List[Dict[str, Any]
     perf_log("VECTOR_SEARCH_START: query_length=%d top_k=%d", len(query), top_k)
     debug_log("QUERY_TEXT: %s", query[:200] + ('...' if len(query) > 200 else ''))
     
+    # Check if search_index is available
+    if search_index is None:
+        logger.error("VECTOR_SEARCH_ERROR: search_index is None - Redis vector search not initialized")
+        return []
+    
     try:
         
         embedding_start = time.time() if enable_timing_logs else None
@@ -1024,7 +1025,7 @@ async def vector_search_tools(query: str, top_k: int = 3) -> List[Dict[str, Any]
             query_embedding = embedding_array.tolist()
             if enable_timing_logs:
                 embedding_time = int((time.time() - embedding_start) * 1000)
-                perf_log("EMBEDDING_GENERATED: method=SentenceTransformer time_ms=%d dimensions=%d", embedding_time, len(query_embedding))
+                perf_log("EMBEDDING_GENERATED: method=AzureOpenAI time_ms=%d dimensions=%d", embedding_time, len(query_embedding))
         except Exception as e:
             logger.error(" CRITICAL: Query embedding generation failed: %s", e)
             raise RuntimeError(f"Cannot generate embedding for query '{query}': {e}")
@@ -1046,7 +1047,9 @@ async def vector_search_tools(query: str, top_k: int = 3) -> List[Dict[str, Any]
         )
         
         # Execute the search (RedisVL query is synchronous)
+        logger.info(f"Executing vector search with top_k={top_k}")
         results = search_index.query(vector_query)
+        logger.info(f"Vector search returned {len(results)} results")
         if enable_timing_logs:
             search_time = int((time.time() - search_start) * 1000)
             perf_log("REDIS_QUERY_COMPLETE: time_ms=%d results_count=%d", search_time, len(results))
@@ -1546,6 +1549,58 @@ async def get_all_tools():
                 "server": server_name
             })
     return all_tools
+
+@app.get("/api/debug/vector-index")
+async def debug_vector_index():
+    """Debug endpoint to check vector index status."""
+    if not is_redis_connected:
+        return {"error": "Redis not connected"}
+    
+    if search_index is None:
+        return {"error": "Search index not initialized"}
+    
+    try:
+        # Count indexed tools
+        indexed_count = len(sync_redis_client.keys("tool:*"))
+        expected_count = sum(len(tools) for tools in TOOLS_CONFIG.values())
+        
+        # Get index info
+        try:
+            index_info = search_index.info()
+        except Exception as e:
+            index_info = {"error": str(e)}
+        
+        # Try a test search
+        test_results = []
+        try:
+            test_embedding = tool_embeddings.generate_embedding("test query")
+            test_query = VectorQuery(
+                vector=test_embedding.tolist(),
+                vector_field_name="embedding",
+                return_fields=["name", "description", "server"],
+                num_results=3
+            )
+            test_search_results = search_index.query(test_query)
+            test_results = [
+                {
+                    "name": r.get("name"),
+                    "server": r.get("server"),
+                    "distance": r.get("vector_distance")
+                }
+                for r in test_search_results
+            ]
+        except Exception as e:
+            test_results = {"error": str(e)}
+        
+        return {
+            "indexed_tools": indexed_count,
+            "expected_tools": expected_count,
+            "index_exists": index_info,
+            "test_search": test_results,
+            "vector_dim": PERFORMANCE_CONFIG.get("vector_dim")
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.delete("/api/cache")
 async def clear_cache():
